@@ -1,0 +1,17 @@
+Project context:
+
+The project is called **Hypervisor-Win64**.
+
+It is a Windows x64 Type-1 hypervisor project that boots from a USB key through UEFI. The hypervisor is intended to start before Windows, initialize the virtualization layer, then launch Windows so the operating system runs above the hypervisor.
+
+The project targets an **AMD-based machine**, so it uses **AMD-V / SVM** virtualization concepts. The relevant AMD terms are **SVM**, **VMCB**, **VMRUN**, **#VMEXIT**, **EFER.SVME**, and potentially **NPT/RVI** for nested paging.
+
+This project does **not** use Intel VMX as its base. Intel-specific concepts like **VMXON**, **VMCS**, **VMLAUNCH**, and **VMCALL** should not be treated as the main implementation path.
+
+For AMD, the hypercall-style instruction is **VMMCALL**, not VMCALL.
+
+The long-term goal is to create a communication channel between the hypervisor and a Windows user-mode application. The Windows application should be able to send commands to the hypervisor, and the hypervisor should be able to send responses or information back to the Windows application.
+
+The communication may rely on mechanisms such as **VMMCALL where valid**, intercepted instructions such as **CPUID**, **#VMEXIT-based communication**, or a **shared memory region** between the hypervisor and the Windows user-mode application.
+
+In simple terms, the project is about running a custom AMD-V/SVM Type-1 hypervisor before Windows, then using it as a low-level layer capable of communicating with a Windows user-mode application.
