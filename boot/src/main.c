@@ -4,6 +4,12 @@
 #define ASM_NOP 0x90
 #define ASM_HLT 0xF4
 
+#define COLOR_DEFAULT EFI_TEXT_ATTR(EFI_LIGHTGRAY, EFI_BLACK)
+#define COLOR_GREEN   EFI_TEXT_ATTR(EFI_LIGHTGREEN, EFI_BLACK)
+#define COLOR_RED     EFI_TEXT_ATTR(EFI_LIGHTRED, EFI_BLACK)
+#define COLOR_YELLOW  EFI_TEXT_ATTR(EFI_YELLOW, EFI_BLACK)
+#define COLOR_CYAN    EFI_TEXT_ATTR(EFI_CYAN, EFI_BLACK)
+
 #define ASM_VMRUN_0 0x0F
 #define ASM_VMRUN_1 0x01
 #define ASM_VMRUN_2 0xD8
@@ -32,6 +38,11 @@ typedef struct _VMCB_SEGMENT
     uint32_t Limit;
     uint64_t Base;
 } __attribute__((packed)) VMCB_SEGMENT;
+
+void set_color(EFI_SYSTEM_TABLE *SystemTable, UINTN color)
+{
+    SystemTable->ConOut->SetAttribute(SystemTable->ConOut, color);
+}
 
 typedef struct _VMCB_CONTROL_AREA
 {
@@ -377,10 +388,22 @@ void svm_vmrun(void *vmcb)
     );
 }
 
+void svm_stgi()
+{
+    __asm__ __volatile__(
+        ".byte 0x0F, 0x01, 0xDC"
+        :
+        :
+        : "memory"
+    );
+}
+
 EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
     void *vmcb = NULL;
     void *host_save_area = NULL;
+
+    set_color(SystemTable, COLOR_DEFAULT);
 
     InitializeLib(ImageHandle, SystemTable);
     Print(L"EFI loaded.\n");
@@ -440,9 +463,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 
         if (v->ControlArea.ExitCode == EXIT_VMMCALL)
         {
+            set_color(SystemTable, COLOR_CYAN);
             Print(L"VMMCALL intercepted.\n");
+            set_color(SystemTable, COLOR_DEFAULT);
 
-            // VMMCALL = 0F 01 D9 = 3 octets
             v->StateSaveArea.Rip += SIZE_VMMCALL;
 
             Print(L"Guest RIP after skip VMMCALL: 0x%lx\n",
@@ -450,9 +474,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         }
         else if (v->ControlArea.ExitCode == EXIT_HLT)
         {
+            set_color(SystemTable, COLOR_GREEN);
             Print(L"HLT intercepted.\n");
+            set_color(SystemTable, COLOR_DEFAULT);
 
-            // HLT = F4 = 1 octet
             v->StateSaveArea.Rip += SIZE_HLT;
 
             Print(L"Guest RIP after skip HLT: 0x%lx\n",
@@ -460,15 +485,41 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         }
         else
         {
+            set_color(SystemTable, COLOR_RED);
             Print(L"Unexpected exit code: 0x%lx\n",
                 v->ControlArea.ExitCode);
+            set_color(SystemTable, COLOR_DEFAULT);
             break;
         }
     }
 
-    while (1) 
-    {
-        __asm__("hlt"); // pause the CPU until the next interrupt.
-    }
+    svm_stgi();
+    __asm__ __volatile__("sti");
+
+    Print(L"\nPress any key to shutdown...\n");
+
+    UINTN index;
+    EFI_INPUT_KEY key;
+
+    SystemTable->ConIn->Reset(SystemTable->ConIn, FALSE);
+
+    SystemTable->BootServices->WaitForEvent(
+        1,
+        &SystemTable->ConIn->WaitForKey,
+        &index
+    );
+
+    SystemTable->ConIn->ReadKeyStroke(
+        SystemTable->ConIn,
+        &key
+    );
+
+    SystemTable->RuntimeServices->ResetSystem(
+        EfiResetShutdown,
+        EFI_SUCCESS,
+        0,
+        NULL
+    );
+
     return EFI_SUCCESS;
 }

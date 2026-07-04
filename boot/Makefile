@@ -29,12 +29,15 @@ $(OUT): src/main.c build/libefi.a
 	@mkdir -p $(dir $(OUT))
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(OUT) src/main.c build/libefi.a
 
-run: $(OUT)
-	"$(QEMU)" -M q35 -m 256 \
-		-drive if=pflash,format=raw,readonly=on,file="$(OVMF_CODE)" \
-		-drive if=pflash,format=raw,file="$(OVMF_VARS)" \
-		-drive format=raw,file=fat:rw:$(ISO_DIR) \
+run:
+	"C:/Program Files/qemu/qemu-system-x86_64.exe" -M q35 -m 256 \
+		-drive if=pflash,format=raw,readonly=on,file="../tools/OVMF_CODE.fd" \
+		-drive if=pflash,format=raw,file="../tools/OVMF_VARS.fd" \
+		-drive format=raw,file=fat:rw:../iso \
 		-net none \
+		-device qemu-xhci \
+		-device usb-kbd \
+		-device usb-tablet \
 		-serial stdio
 
 re: clean all
