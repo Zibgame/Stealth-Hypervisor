@@ -1,6 +1,30 @@
 #include <efi.h>
 #include <efilib.h>
 
+#define ASM_NOP 0x90
+#define ASM_HLT 0xF4
+
+#define ASM_VMRUN_0 0x0F
+#define ASM_VMRUN_1 0x01
+#define ASM_VMRUN_2 0xD8
+
+#define ASM_VMMCALL_0 0x0F
+#define ASM_VMMCALL_1 0x01
+#define ASM_VMMCALL_2 0xD9
+
+#define ASM_JMP_REL8 0xEB
+
+#define SIZE_NOP 1
+#define SIZE_HLT 1
+#define SIZE_VMRUN 3
+#define SIZE_VMMCALL 3
+#define SIZE_JMP_REL8 2
+
+#define EXIT_VMMCALL 0x81
+#define EXIT_HLT     0x78
+
+uint64_t g_guest_program_size = 0;
+
 typedef struct _VMCB_SEGMENT
 {
     uint16_t Selector;
@@ -218,6 +242,26 @@ void* init_VMCB(EFI_SYSTEM_TABLE *SystemTable)
     return vmcb;
 }
 
+uint64_t init_rip(void *rip_ptr, EFI_SYSTEM_TABLE *SystemTable)
+{
+    uint8_t *code = (uint8_t*)rip_ptr;
+
+    uint64_t offset = 0;
+
+    code[offset++] = ASM_NOP; // offset 0
+    code[offset++] = ASM_NOP; // offset 1
+
+    code[offset++] = ASM_VMMCALL_0; // offset 2
+    code[offset++] = ASM_VMMCALL_1;
+    code[offset++] = ASM_VMMCALL_2;
+
+    code[offset++] = ASM_NOP; // offset 5
+
+    code[offset++] = ASM_HLT; // offset 6
+
+    return offset; // ici offset = 7
+}
+
 void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
 {
     VMCB *vmcb = (VMCB*)vmcb_ptr;
@@ -229,12 +273,8 @@ void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
         raw[i] = 0;
     }
 
-    // Interception minimale : HLT (bit 24 de InterceptMisc1)
     vmcb->ControlArea.InterceptMisc1 = (1 << 24);
-
-    // Interception obligatoire de VMRUN (bit 0 de InterceptMisc2)
-    // Sans ce bit, le CPU refuse VMRUN et renvoie ExitCode = VMEXIT_INVALID (0xFFFFFFFFFFFFFFFF)
-    vmcb->ControlArea.InterceptMisc2 = (1 << 0);
+vmcb->ControlArea.InterceptMisc2 = (1 << 0) | (1 << 1);
 
     // ASID obligatoire
     vmcb->ControlArea.GuestAsid = 1;
@@ -242,37 +282,37 @@ void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
 
     // etat initial du guest (State Save Area)
     vmcb->StateSaveArea.Rflags = 0x2;
-    vmcb->StateSaveArea.Cr0 = read_cr0();
-    vmcb->StateSaveArea.Efer = read_msr(0xC0000080);
+    vmcb->StateSaveArea.Cr0 = 0x60000010;
+    vmcb->StateSaveArea.Efer = (1ULL << 12);
 
-    vmcb->StateSaveArea.Cs.Selector = 0x0008;
-    vmcb->StateSaveArea.Cs.Attrib   = 0x0A9B; // code 64-bit, present, granularity
-    vmcb->StateSaveArea.Cs.Limit    = 0xFFFFFFFF;
+    vmcb->StateSaveArea.Cs.Selector = 0x0000;
+    vmcb->StateSaveArea.Cs.Attrib   = 0x009B;
+    vmcb->StateSaveArea.Cs.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Cs.Base     = 0x00000000;
 
-    vmcb->StateSaveArea.Ss.Selector = 0x0010;
-    vmcb->StateSaveArea.Ss.Attrib   = 0x0C93; // data, present, default size, granularity
-    vmcb->StateSaveArea.Ss.Limit    = 0xFFFFFFFF;
+    vmcb->StateSaveArea.Ss.Selector = 0x0000;
+    vmcb->StateSaveArea.Ss.Attrib   = 0x0093;
+    vmcb->StateSaveArea.Ss.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Ss.Base     = 0x00000000;
 
-    vmcb->StateSaveArea.Ds.Selector = 0x0010;
-    vmcb->StateSaveArea.Ds.Attrib   = 0x0C93;
-    vmcb->StateSaveArea.Ds.Limit    = 0xFFFFFFFF;
+    vmcb->StateSaveArea.Ds.Selector = 0x0000;
+    vmcb->StateSaveArea.Ds.Attrib   = 0x0093;
+    vmcb->StateSaveArea.Ds.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Ds.Base     = 0x00000000;
 
-    vmcb->StateSaveArea.Es.Selector = 0x0010;
-    vmcb->StateSaveArea.Es.Attrib   = 0x0C93;
-    vmcb->StateSaveArea.Es.Limit    = 0xFFFFFFFF;
+    vmcb->StateSaveArea.Es.Selector = 0x0000;
+    vmcb->StateSaveArea.Es.Attrib   = 0x0093;
+    vmcb->StateSaveArea.Es.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Es.Base     = 0x00000000;
 
-    vmcb->StateSaveArea.Fs.Selector = 0x0010;
-    vmcb->StateSaveArea.Fs.Attrib   = 0x0C93;
-    vmcb->StateSaveArea.Fs.Limit    = 0xFFFFFFFF;
+    vmcb->StateSaveArea.Fs.Selector = 0x0000;
+    vmcb->StateSaveArea.Fs.Attrib   = 0x0093;
+    vmcb->StateSaveArea.Fs.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Fs.Base     = 0x00000000;
 
-    vmcb->StateSaveArea.Gs.Selector = 0x0010;
-    vmcb->StateSaveArea.Gs.Attrib   = 0x0C93;
-    vmcb->StateSaveArea.Gs.Limit    = 0xFFFFFFFF;
+    vmcb->StateSaveArea.Gs.Selector = 0x0000;
+    vmcb->StateSaveArea.Gs.Attrib   = 0x0093;
+    vmcb->StateSaveArea.Gs.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Gs.Base     = 0x00000000;
 
     vmcb->StateSaveArea.Gdtr.Selector = 0x0000;
@@ -285,15 +325,15 @@ void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
     vmcb->StateSaveArea.Idtr.Limit    = 0x0000;
     vmcb->StateSaveArea.Idtr.Base     = 0x00000000;
 
-    vmcb->StateSaveArea.Tr.Selector = 0x0018;
+    vmcb->StateSaveArea.Tr.Selector = 0x0000;
     vmcb->StateSaveArea.Tr.Attrib   = 0x008B;
     vmcb->StateSaveArea.Tr.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Tr.Base     = 0x00000000;
 
     vmcb->StateSaveArea.Cpl = 0;
 
-    vmcb->StateSaveArea.Cr4 = read_cr4();
-    vmcb->StateSaveArea.Cr3 = read_cr3();
+    vmcb->StateSaveArea.Cr4 = 0;
+    vmcb->StateSaveArea.Cr3 = 0;
     
     vmcb->StateSaveArea.Dr6 = 0xFFFF0FF0;
     vmcb->StateSaveArea.Dr7 = 0x00000400;
@@ -316,17 +356,13 @@ void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
 
     Print(L"Guest code allocated at address: %p\n", guest_code);
 
-    uint8_t *code = (uint8_t*)guest_code;
+    g_guest_program_size = init_rip(guest_code, SystemTable);
 
-    for (int i = 0; i < 4096; i++)
-    {
-        code[i] = 0xF4; // HLT
-    }
+    vmcb->StateSaveArea.Cs.Base = (uint64_t)(uintptr_t)guest_code;
+    vmcb->StateSaveArea.Rip = 0;
 
-    vmcb->StateSaveArea.Rip = (uint64_t)(uintptr_t)guest_code;
-
-    // Set the guest RSP to point to the top of the allocated page minus 16 bytes for alignment
-    vmcb->StateSaveArea.Rsp = (uint64_t)(uintptr_t)guest_code + 0x1000 - 0x10;
+    vmcb->StateSaveArea.Ss.Base = (uint64_t)(uintptr_t)guest_code;
+    vmcb->StateSaveArea.Rsp = 0x1000 - 0x10;
 
     Print(L"Guest RIP set to: %p\n", guest_code);
 }
@@ -384,17 +420,51 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     write_msr(0xC0010117, (uint64_t)(uintptr_t)host_save_area); // MSR_VM_HSAVE_PA
     Print(L"VM_HSAVE_PA configured.\n");
 
-    Print(L"Before VMRUN.\n");
-
-    svm_vmrun(vmcb);
-
-    Print(L"After VMRUN.\n");
 
     VMCB *v = (VMCB*)vmcb;
 
-    Print(L"ExitCode: 0x%lx\n", v->ControlArea.ExitCode);
-    Print(L"ExitInfo1: 0x%lx\n", v->ControlArea.ExitInfo1);
-    Print(L"ExitInfo2: 0x%lx\n", v->ControlArea.ExitInfo2);
+    Print(L"Before VMRUN.\n");
+
+    uint64_t i = 0;
+
+    while (v->StateSaveArea.Rip < g_guest_program_size)
+    {
+        Print(L"\nBefore VMRUN, RIP: 0x%lx / size: 0x%lx\n",
+            v->StateSaveArea.Rip,
+            g_guest_program_size);
+
+        svm_vmrun(vmcb);
+
+        Print(L"ExitCode: 0x%lx\n", v->ControlArea.ExitCode);
+        Print(L"Guest RIP after VMEXIT: 0x%lx\n", v->StateSaveArea.Rip);
+
+        if (v->ControlArea.ExitCode == EXIT_VMMCALL)
+        {
+            Print(L"VMMCALL intercepted.\n");
+
+            // VMMCALL = 0F 01 D9 = 3 octets
+            v->StateSaveArea.Rip += SIZE_VMMCALL;
+
+            Print(L"Guest RIP after skip VMMCALL: 0x%lx\n",
+                v->StateSaveArea.Rip);
+        }
+        else if (v->ControlArea.ExitCode == EXIT_HLT)
+        {
+            Print(L"HLT intercepted.\n");
+
+            // HLT = F4 = 1 octet
+            v->StateSaveArea.Rip += SIZE_HLT;
+
+            Print(L"Guest RIP after skip HLT: 0x%lx\n",
+                v->StateSaveArea.Rip);
+        }
+        else
+        {
+            Print(L"Unexpected exit code: 0x%lx\n",
+                v->ControlArea.ExitCode);
+            break;
+        }
+    }
 
     while (1) 
     {
