@@ -10,26 +10,22 @@
 #define COLOR_YELLOW  EFI_TEXT_ATTR(EFI_YELLOW, EFI_BLACK)
 #define COLOR_CYAN    EFI_TEXT_ATTR(EFI_CYAN, EFI_BLACK)
 
-#define ASM_VMRUN_0 0x0F
-#define ASM_VMRUN_1 0x01
-#define ASM_VMRUN_2 0xD8
-
 #define ASM_VMMCALL_0 0x0F
 #define ASM_VMMCALL_1 0x01
 #define ASM_VMMCALL_2 0xD9
 
-#define ASM_JMP_REL8 0xEB
-
-#define SIZE_NOP 1
 #define SIZE_HLT 1
-#define SIZE_VMRUN 3
 #define SIZE_VMMCALL 3
-#define SIZE_JMP_REL8 2
 
 #define EXIT_VMMCALL 0x81
 #define EXIT_HLT     0x78
 
 uint64_t g_guest_program_size = 0;
+
+void set_color(EFI_SYSTEM_TABLE *SystemTable, UINTN color)
+{
+    SystemTable->ConOut->SetAttribute(SystemTable->ConOut, color);
+}
 
 typedef struct _VMCB_SEGMENT
 {
@@ -38,11 +34,6 @@ typedef struct _VMCB_SEGMENT
     uint32_t Limit;
     uint64_t Base;
 } __attribute__((packed)) VMCB_SEGMENT;
-
-void set_color(EFI_SYSTEM_TABLE *SystemTable, UINTN color)
-{
-    SystemTable->ConOut->SetAttribute(SystemTable->ConOut, color);
-}
 
 typedef struct _VMCB_CONTROL_AREA
 {
@@ -150,6 +141,7 @@ uint64_t read_msr(uint32_t msr) //  MSR (Model-Specific Register)
     return ((uint64_t)high << 32) | low;
 }
 
+// reserved for future NPT setup (reading guest/host CR state for page table work)
 uint64_t read_cr0()
 {
     uint64_t value;
@@ -253,7 +245,7 @@ void* init_VMCB(EFI_SYSTEM_TABLE *SystemTable)
     return vmcb;
 }
 
-uint64_t init_rip(void *rip_ptr, EFI_SYSTEM_TABLE *SystemTable)
+uint64_t init_rip(void *rip_ptr)
 {
     uint8_t *code = (uint8_t*)rip_ptr;
 
@@ -285,71 +277,90 @@ void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
     }
 
     vmcb->ControlArea.InterceptMisc1 = (1 << 24);
-vmcb->ControlArea.InterceptMisc2 = (1 << 0) | (1 << 1);
+    vmcb->ControlArea.InterceptMisc2 = (1 << 0) | (1 << 1);
 
     // ASID obligatoire
     vmcb->ControlArea.GuestAsid = 1;
     vmcb->ControlArea.TlbControl = 1;
 
     // etat initial du guest (State Save Area)
+
+    // RFLAGS: bit 1 always set to 1 (reserved by x86), no other flag active
     vmcb->StateSaveArea.Rflags = 0x2;
+
+    // CR0: minimal valid state (protection enable + other required bits), real/protected mode base
     vmcb->StateSaveArea.Cr0 = 0x60000010;
+
+    // EFER.SVME must be 1 in guest state, required by AMD consistency checks
+    // (VMEXIT_INVALID otherwise) — does not enable nested virtualization by itself
     vmcb->StateSaveArea.Efer = (1ULL << 12);
 
+    // CS: code segment, executable + readable + present
     vmcb->StateSaveArea.Cs.Selector = 0x0000;
     vmcb->StateSaveArea.Cs.Attrib   = 0x009B;
     vmcb->StateSaveArea.Cs.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Cs.Base     = 0x00000000;
 
+    // SS: stack segment, data + writable + present
     vmcb->StateSaveArea.Ss.Selector = 0x0000;
     vmcb->StateSaveArea.Ss.Attrib   = 0x0093;
     vmcb->StateSaveArea.Ss.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Ss.Base     = 0x00000000;
 
+    // DS: data segment, same attributes as SS
     vmcb->StateSaveArea.Ds.Selector = 0x0000;
     vmcb->StateSaveArea.Ds.Attrib   = 0x0093;
     vmcb->StateSaveArea.Ds.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Ds.Base     = 0x00000000;
 
+    // ES: extra data segment, same attributes as SS/DS
     vmcb->StateSaveArea.Es.Selector = 0x0000;
     vmcb->StateSaveArea.Es.Attrib   = 0x0093;
     vmcb->StateSaveArea.Es.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Es.Base     = 0x00000000;
 
+    // FS: extra segment, same attributes as SS/DS
     vmcb->StateSaveArea.Fs.Selector = 0x0000;
     vmcb->StateSaveArea.Fs.Attrib   = 0x0093;
     vmcb->StateSaveArea.Fs.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Fs.Base     = 0x00000000;
 
+    // GS: extra segment, same attributes as SS/DS
     vmcb->StateSaveArea.Gs.Selector = 0x0000;
     vmcb->StateSaveArea.Gs.Attrib   = 0x0093;
     vmcb->StateSaveArea.Gs.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Gs.Base     = 0x00000000;
 
+    // GDTR: no GDT set up yet for this minimal guest, left empty
     vmcb->StateSaveArea.Gdtr.Selector = 0x0000;
     vmcb->StateSaveArea.Gdtr.Attrib   = 0x0000;
     vmcb->StateSaveArea.Gdtr.Limit    = 0x0000;
     vmcb->StateSaveArea.Gdtr.Base     = 0x00000000;
 
+    // IDTR: no IDT set up yet for this minimal guest, left empty
     vmcb->StateSaveArea.Idtr.Selector = 0x0000;
     vmcb->StateSaveArea.Idtr.Attrib   = 0x0000;
     vmcb->StateSaveArea.Idtr.Limit    = 0x0000;
     vmcb->StateSaveArea.Idtr.Base     = 0x00000000;
 
+    // TR: task register, present + 32-bit TSS type, not really used by this guest
     vmcb->StateSaveArea.Tr.Selector = 0x0000;
     vmcb->StateSaveArea.Tr.Attrib   = 0x008B;
     vmcb->StateSaveArea.Tr.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Tr.Base     = 0x00000000;
 
+    // CPL: guest starts at ring 0 (most privileged)
     vmcb->StateSaveArea.Cpl = 0;
 
+    // CR4/CR3: no paging, no extended features yet (NPT disabled, guest uses no page tables)
     vmcb->StateSaveArea.Cr4 = 0;
     vmcb->StateSaveArea.Cr3 = 0;
-    
+
+    // DR6/DR7: default reset values defined by the x86 spec for debug registers
     vmcb->StateSaveArea.Dr6 = 0xFFFF0FF0;
     vmcb->StateSaveArea.Dr7 = 0x00000400;
 
-    // alouer memoir pour rip
+    // allocate memory for rip
     void *guest_code = NULL;
 
     EFI_STATUS status = SystemTable->BootServices->AllocatePages(
@@ -367,15 +378,69 @@ vmcb->ControlArea.InterceptMisc2 = (1 << 0) | (1 << 1);
 
     Print(L"Guest code allocated at address: %p\n", guest_code);
 
-    g_guest_program_size = init_rip(guest_code, SystemTable);
+    g_guest_program_size = init_rip(guest_code);
 
+    // guest starts executing at offset 0 of its own code page
     vmcb->StateSaveArea.Cs.Base = (uint64_t)(uintptr_t)guest_code;
     vmcb->StateSaveArea.Rip = 0;
 
+    // guest stack lives in the same page, growing down from near the top
     vmcb->StateSaveArea.Ss.Base = (uint64_t)(uintptr_t)guest_code;
     vmcb->StateSaveArea.Rsp = 0x1000 - 0x10;
 
     Print(L"Guest RIP set to: %p\n", guest_code);
+
+    // IOPM: I/O Permission Map, 3 pages, required by VMRUN even with no I/O intercepted
+    void *iopm = NULL;
+
+    status = SystemTable->BootServices->AllocatePages(
+        AllocateAnyPages,
+        EfiRuntimeServicesData,
+        3,
+        (EFI_PHYSICAL_ADDRESS *)&iopm
+    );
+
+    if (status != EFI_SUCCESS)
+    {
+        Print(L"Failed to allocate IOPM. Status: %d\n", status);
+        return;
+    }
+
+    // zeroed IOPM = no I/O port is intercepted
+    uint8_t *iopm_raw = (uint8_t*)iopm;
+    for (int i = 0; i < 3 * 4096; i++)
+    {
+        iopm_raw[i] = 0;
+    }
+
+    vmcb->ControlArea.IopmBasePa = (uint64_t)(uintptr_t)iopm;
+    Print(L"IOPM allocated at address: %p\n", iopm);
+
+    // MSRPM: MSR Permission Map, 2 pages, required by VMRUN even with no MSR intercepted
+    void *msrpm = NULL;
+
+    status = SystemTable->BootServices->AllocatePages(
+        AllocateAnyPages,
+        EfiRuntimeServicesData,
+        2,
+        (EFI_PHYSICAL_ADDRESS *)&msrpm
+    );
+
+    if (status != EFI_SUCCESS)
+    {
+        Print(L"Failed to allocate MSRPM. Status: %d\n", status);
+        return;
+    }
+
+    // zeroed MSRPM = no MSR access is intercepted
+    uint8_t *msrpm_raw = (uint8_t*)msrpm;
+    for (int i = 0; i < 2 * 4096; i++)
+    {
+        msrpm_raw[i] = 0;
+    }
+
+    vmcb->ControlArea.MsrpmBasePa = (uint64_t)(uintptr_t)msrpm;
+    Print(L"MSRPM allocated at address: %p\n", msrpm);
 }
 
 void svm_vmrun(void *vmcb)
@@ -443,12 +508,9 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     write_msr(0xC0010117, (uint64_t)(uintptr_t)host_save_area); // MSR_VM_HSAVE_PA
     Print(L"VM_HSAVE_PA configured.\n");
 
-
     VMCB *v = (VMCB*)vmcb;
 
     Print(L"Before VMRUN.\n");
-
-    uint64_t i = 0;
 
     while (v->StateSaveArea.Rip < g_guest_program_size)
     {
