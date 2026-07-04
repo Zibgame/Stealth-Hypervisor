@@ -11,6 +11,11 @@ LIB_OBJS = $(patsubst %.c,build/%.o,$(LIB_SRCS))
 
 OUT = ../iso/EFI/BOOT/BOOTX64.EFI
 
+QEMU = C:/Program Files/qemu/qemu-system-x86_64.exe
+OVMF_CODE = ../tools/OVMF_CODE.fd
+OVMF_VARS = ../tools/OVMF_VARS.fd
+ISO_DIR = ../iso
+
 all: $(OUT)
 
 build/%.o: %.c
@@ -24,5 +29,16 @@ $(OUT): src/main.c build/libefi.a
 	@mkdir -p $(dir $(OUT))
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(OUT) src/main.c build/libefi.a
 
+run: $(OUT)
+	"$(QEMU)" -M q35 -m 256 \
+		-drive if=pflash,format=raw,readonly=on,file="$(OVMF_CODE)" \
+		-drive if=pflash,format=raw,file="$(OVMF_VARS)" \
+		-drive format=raw,file=fat:rw:$(ISO_DIR) \
+		-net none \
+		-serial stdio
+
+re: clean all
+
 clean:
-	rm -rf build $(OUT)
+	rm -rf build ../iso
+	mkdir -p ../iso/EFI/BOOT
