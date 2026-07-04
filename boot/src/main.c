@@ -248,18 +248,18 @@ uint64_t init_rip(void *rip_ptr, EFI_SYSTEM_TABLE *SystemTable)
 
     uint64_t offset = 0;
 
-    code[offset++] = ASM_NOP; // offset 0
-    code[offset++] = ASM_NOP; // offset 1
+    code[offset++] = ASM_NOP;
+    code[offset++] = ASM_NOP;
 
-    code[offset++] = ASM_VMMCALL_0; // offset 2
+    code[offset++] = ASM_VMMCALL_0;
     code[offset++] = ASM_VMMCALL_1;
     code[offset++] = ASM_VMMCALL_2;
 
-    code[offset++] = ASM_NOP; // offset 5
+    code[offset++] = ASM_NOP;
 
-    code[offset++] = ASM_HLT; // offset 6
+    code[offset++] = ASM_HLT;
 
-    return offset; // ici offset = 7
+    return offset; 
 }
 
 void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
