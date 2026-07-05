@@ -67,7 +67,11 @@ typedef struct _VMCB_CONTROL_AREA
 
     uint64_t NpEnable;
 
-    uint8_t  Reserved4[0x400 - 0x98];
+    uint8_t  Reserved5[0xb0 - 0x98]; // AVIC bar, GHCB, EVENTINJ — unused for now
+
+    uint64_t NCr3; // physical address of the nested page tables (PML4)
+
+    uint8_t  Reserved6[0x400 - 0xb8];
 } __attribute__((packed)) VMCB_CONTROL_AREA;
 
 typedef struct _VMCB_STATE_SAVE_AREA
@@ -106,6 +110,92 @@ typedef struct _VMCB
     VMCB_STATE_SAVE_AREA StateSaveArea;
 } __attribute__((packed)) VMCB;
 
+int check_1gb_pages_support()
+{
+    uint32_t eax, ebx, ecx, edx;
+    eax = 0x80000001;
+
+    __asm__ __volatile__(
+        "cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(eax)
+    );
+
+    if (!(edx & (1 << 26))) // Page1GB feature bit
+    {
+        Print(L"1GB pages not supported on this CPU.\n");
+        return 0;
+    }
+    else
+    {
+        Print(L"1GB pages supported on this CPU.\n");
+        return 1;
+    }
+}
+
+void* init_NPT(EFI_SYSTEM_TABLE *SystemTable)
+{
+    if (!check_1gb_pages_support())
+    {
+        Print(L"Cannot build NPT without 1GB page support.\n");
+        return NULL;
+    }
+
+    void *pml4 = NULL;
+    void *pdpt = NULL;
+    EFI_STATUS status;
+
+    // PML4: top level table, 1 page
+    status = SystemTable->BootServices->AllocatePages(
+        AllocateAnyPages,
+        EfiRuntimeServicesData,
+        1,
+        (EFI_PHYSICAL_ADDRESS *)&pml4
+    );
+    if (status != EFI_SUCCESS)
+    {
+        Print(L"Failed to allocate NPT PML4. Status: %d\n", status);
+        return NULL;
+    }
+
+    // PDPT: second level table, 1 page
+    status = SystemTable->BootServices->AllocatePages(
+        AllocateAnyPages,
+        EfiRuntimeServicesData,
+        1,
+        (EFI_PHYSICAL_ADDRESS *)&pdpt
+    );
+    if (status != EFI_SUCCESS)
+    {
+        Print(L"Failed to allocate NPT PDPT. Status: %d\n", status);
+        return NULL;
+    }
+
+    // clear both tables
+    uint64_t *pml4_entries = (uint64_t*)pml4;
+    uint64_t *pdpt_entries = (uint64_t*)pdpt;
+    for (int i = 0; i < 512; i++)
+    {
+        pml4_entries[i] = 0;
+        pdpt_entries[i] = 0;
+    }
+
+    // PML4[0] points to our PDPT. Flags: Present(0) + Writable(1) + User(2)
+    pml4_entries[0] = ((uint64_t)(uintptr_t)pdpt) | 0x7;
+
+    // PDPT[0..3]: four 1GB entries, identity-mapped, covering 0GB to 4GB
+    // Flags: Present(0) + Writable(1) + User(2) + PageSize/1GB(7)
+    for (int i = 0; i < 4; i++)
+    {
+        uint64_t phys_1gb_base = (uint64_t)i * 0x40000000ULL; // i * 1GB
+        pdpt_entries[i] = phys_1gb_base | 0x87;
+    }
+
+    Print(L"NPT built. PML4 at: %p, PDPT at: %p\n", pml4, pdpt);
+
+    return pml4;
+}
+
 int check_svm_support() //SVM — Secure Virtual Machine
 {
     uint32_t eax, ebx, ecx, edx;
@@ -130,7 +220,7 @@ int check_svm_support() //SVM — Secure Virtual Machine
     }
 }
 
-uint64_t read_msr(uint32_t msr) //  MSR (Model-Specific Register) 
+uint64_t read_msr(uint32_t msr) //  MSR (Model-Specific Register)
 { 
     uint32_t low, high;
     __asm__ __volatile__(
@@ -259,6 +349,12 @@ uint64_t init_rip(void *rip_ptr)
     code[offset++] = ASM_VMMCALL_2;
 
     code[offset++] = ASM_NOP;
+
+    code[offset++] = ASM_HLT;
+
+    code[offset++] = ASM_VMMCALL_0;
+    code[offset++] = ASM_VMMCALL_1;
+    code[offset++] = ASM_VMMCALL_2;
 
     code[offset++] = ASM_HLT;
 
@@ -441,6 +537,18 @@ void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
 
     vmcb->ControlArea.MsrpmBasePa = (uint64_t)(uintptr_t)msrpm;
     Print(L"MSRPM allocated at address: %p\n", msrpm);
+
+    // Nested Paging setup: identity-map the first 4GB so the guest sees
+    // the same physical memory as the host, via NPT translation
+    void *npt_pml4 = init_NPT(SystemTable);
+    if (npt_pml4 == NULL)
+    {
+        Print(L"Failed to build NPT, aborting VMCB fill.\n");
+        return;
+    }
+
+    vmcb->ControlArea.NpEnable = 1;
+    vmcb->ControlArea.NCr3 = (uint64_t)(uintptr_t)npt_pml4;
 }
 
 void svm_vmrun(void *vmcb)

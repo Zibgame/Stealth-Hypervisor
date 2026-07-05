@@ -31,6 +31,7 @@ $(OUT): src/main.c build/libefi.a
 
 run:
 	"C:/Program Files/qemu/qemu-system-x86_64.exe" -M q35 -m 256 \
+		-cpu qemu64,+svm,+pdpe1gb \
 		-drive if=pflash,format=raw,readonly=on,file="../tools/OVMF_CODE.fd" \
 		-drive if=pflash,format=raw,file="../tools/OVMF_VARS.fd" \
 		-drive format=raw,file=fat:rw:../iso \
