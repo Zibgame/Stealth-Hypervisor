@@ -21,6 +21,7 @@
 #define EXIT_HLT     0x78
 
 uint64_t g_guest_program_size = 0;
+uint64_t g_guest_code_base = 0;
 
 void set_color(EFI_SYSTEM_TABLE *SystemTable, UINTN color)
 {
@@ -361,6 +362,53 @@ uint64_t init_rip(void *rip_ptr)
     return offset; 
 }
 
+void* init_GuestPageTables(EFI_SYSTEM_TABLE *SystemTable)
+{
+    void *pml4 = NULL;
+    void *pdpt = NULL;
+    EFI_STATUS status;
+
+    status = SystemTable->BootServices->AllocatePages(
+        AllocateAnyPages, EfiRuntimeServicesData, 1,
+        (EFI_PHYSICAL_ADDRESS *)&pml4
+    );
+    if (status != EFI_SUCCESS)
+    {
+        Print(L"Failed to allocate guest PML4. Status: %d\n", status);
+        return NULL;
+    }
+
+    status = SystemTable->BootServices->AllocatePages(
+        AllocateAnyPages, EfiRuntimeServicesData, 1,
+        (EFI_PHYSICAL_ADDRESS *)&pdpt
+    );
+    if (status != EFI_SUCCESS)
+    {
+        Print(L"Failed to allocate guest PDPT. Status: %d\n", status);
+        return NULL;
+    }
+
+    uint64_t *pml4_entries = (uint64_t*)pml4;
+    uint64_t *pdpt_entries = (uint64_t*)pdpt;
+    for (int i = 0; i < 512; i++)
+    {
+        pml4_entries[i] = 0;
+        pdpt_entries[i] = 0;
+    }
+
+    // same identity-map pattern as NPT: guest virtual == guest physical
+    pml4_entries[0] = ((uint64_t)(uintptr_t)pdpt) | 0x7;
+
+    for (int i = 0; i < 4; i++)
+    {
+        uint64_t phys_1gb_base = (uint64_t)i * 0x40000000ULL;
+        pdpt_entries[i] = phys_1gb_base | 0x87;
+    }
+
+    Print(L"Guest page tables built. PML4 at: %p\n", pml4);
+    return pml4;
+}
+
 void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
 {
     VMCB *vmcb = (VMCB*)vmcb_ptr;
@@ -384,16 +432,19 @@ void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
     // RFLAGS: bit 1 always set to 1 (reserved by x86), no other flag active
     vmcb->StateSaveArea.Rflags = 0x2;
 
-    // CR0: minimal valid state (protection enable + other required bits), real/protected mode base
-    vmcb->StateSaveArea.Cr0 = 0x60000010;
+    // CR0: keep previous bits (ET, CD, NW), add PE (protected mode) + PG (paging)
+    vmcb->StateSaveArea.Cr0 = 0x60000010 | 0x80000001;
 
-    // EFER.SVME must be 1 in guest state, required by AMD consistency checks
-    // (VMEXIT_INVALID otherwise) — does not enable nested virtualization by itself
-    vmcb->StateSaveArea.Efer = (1ULL << 12);
+    // EFER: SVME (bit12, mandatory) + LME (bit8, long mode enable) + LMA (bit10, long mode active)
+    // LMA must be set explicitly here since VMRUN loads guest EFER as-is, it does not
+    // auto-compute LMA from PG+LME like a real mode transition would
+    vmcb->StateSaveArea.Efer = (1ULL << 12) | (1ULL << 8) | (1ULL << 10);
 
     // CS: code segment, executable + readable + present
     vmcb->StateSaveArea.Cs.Selector = 0x0000;
-    vmcb->StateSaveArea.Cs.Attrib   = 0x009B;
+        // Attrib 0x0A9B = same as before (present, code, exec/read) but with L bit set (long mode)
+    // AMD manual: only D, L, R bits of CS are observed by hardware — this is the one that matters here
+    vmcb->StateSaveArea.Cs.Attrib   = 0x0A9B;
     vmcb->StateSaveArea.Cs.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Cs.Base     = 0x00000000;
 
@@ -449,7 +500,8 @@ void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
     vmcb->StateSaveArea.Cpl = 0;
 
     // CR4/CR3: no paging, no extended features yet (NPT disabled, guest uses no page tables)
-    vmcb->StateSaveArea.Cr4 = 0;
+    // CR4.PAE (bit5) is mandatory for long mode
+    vmcb->StateSaveArea.Cr4 = (1ULL << 5);
     vmcb->StateSaveArea.Cr3 = 0;
 
     // DR6/DR7: default reset values defined by the x86 spec for debug registers
@@ -475,15 +527,23 @@ void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
     Print(L"Guest code allocated at address: %p\n", guest_code);
 
     g_guest_program_size = init_rip(guest_code);
+    g_guest_code_base = (uint64_t)(uintptr_t)guest_code;
 
-    // guest starts executing at offset 0 of its own code page
-    vmcb->StateSaveArea.Cs.Base = (uint64_t)(uintptr_t)guest_code;
-    vmcb->StateSaveArea.Rip = 0;
+    // In 64-bit mode (CS.L=1), segment bases are ignored by the CPU (except FS/GS).
+    // RIP and RSP must be real linear addresses directly, not offsets from a base.
+    vmcb->StateSaveArea.Cs.Base = 0;
+    vmcb->StateSaveArea.Rip = (uint64_t)(uintptr_t)guest_code;
 
-    // guest stack lives in the same page, growing down from near the top
-    vmcb->StateSaveArea.Ss.Base = (uint64_t)(uintptr_t)guest_code;
-    vmcb->StateSaveArea.Rsp = 0x1000 - 0x10;
+    vmcb->StateSaveArea.Ss.Base = 0;
+    vmcb->StateSaveArea.Rsp = (uint64_t)(uintptr_t)guest_code + 0x1000 - 0x10;
 
+    void *guest_pt = init_GuestPageTables(SystemTable);
+    if (guest_pt == NULL)
+    {
+        Print(L"Failed to build guest page tables, aborting VMCB fill.\n");
+        return;
+    }
+    vmcb->StateSaveArea.Cr3 = (uint64_t)(uintptr_t)guest_pt;
     Print(L"Guest RIP set to: %p\n", guest_code);
 
     // IOPM: I/O Permission Map, 3 pages, required by VMRUN even with no I/O intercepted
@@ -620,7 +680,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 
     Print(L"Before VMRUN.\n");
 
-    while (v->StateSaveArea.Rip < g_guest_program_size)
+    while (v->StateSaveArea.Rip < g_guest_code_base + g_guest_program_size)
     {
         Print(L"\nBefore VMRUN, RIP: 0x%lx / size: 0x%lx\n",
             v->StateSaveArea.Rip,
