@@ -111,6 +111,115 @@ typedef struct _VMCB
     VMCB_STATE_SAVE_AREA StateSaveArea;
 } __attribute__((packed)) VMCB;
 
+uint64_t get_highest_physical_address(EFI_SYSTEM_TABLE *SystemTable)
+{
+    EFI_STATUS status;
+    UINTN map_size = 0;
+    UINTN map_key = 0;
+    UINTN descriptor_size = 0;
+    UINT32 descriptor_version = 0;
+    EFI_MEMORY_DESCRIPTOR *memory_map = NULL;
+
+    // First call: just asks for the required buffer size (fails on purpose)
+    status = SystemTable->BootServices->GetMemoryMap(
+        &map_size, memory_map, &map_key, &descriptor_size, &descriptor_version
+    );
+
+    // add some margin, the map can grow between the two calls
+    map_size += 2 * descriptor_size;
+
+    status = SystemTable->BootServices->AllocatePool(
+        EfiLoaderData, map_size, (void**)&memory_map
+    );
+    if (status != EFI_SUCCESS)
+    {
+        Print(L"Failed to allocate memory map buffer. Status: %d\n", status);
+        return 0;
+    }
+
+    // Second call: actually fills the buffer this time
+    status = SystemTable->BootServices->GetMemoryMap(
+        &map_size, memory_map, &map_key, &descriptor_size, &descriptor_version
+    );
+    if (status != EFI_SUCCESS)
+    {
+        Print(L"Failed to get memory map. Status: %d\n", status);
+        return 0;
+    }
+
+    uint64_t highest = 0;
+    UINTN entry_count = map_size / descriptor_size;
+
+    for (UINTN i = 0; i < entry_count; i++)
+    {
+        EFI_MEMORY_DESCRIPTOR *entry = (EFI_MEMORY_DESCRIPTOR*)(
+            (uint8_t*)memory_map + i * descriptor_size
+        );
+
+        uint64_t entry_end = entry->PhysicalStart + (entry->NumberOfPages * 4096ULL);
+        if (entry_end > highest)
+        {
+            highest = entry_end;
+        }
+    }
+
+    Print(L"Highest physical address found: 0x%lx\n", highest);
+    return highest;
+}
+
+uint64_t* init_GDT(EFI_SYSTEM_TABLE *SystemTable)
+{
+    void *gdt = NULL;
+    EFI_STATUS status;
+
+    status = SystemTable->BootServices->AllocatePages(
+        AllocateAnyPages, EfiRuntimeServicesData, 1,
+        (EFI_PHYSICAL_ADDRESS *)&gdt
+    );
+    if (status != EFI_SUCCESS)
+    {
+        Print(L"Failed to allocate GDT. Status: %d\n", status);
+        return NULL;
+    }
+
+    uint64_t *entries = (uint64_t*)gdt;
+
+    entries[0] = 0x0000000000000000ULL; // null descriptor, always required at index 0
+    entries[1] = 0x00209A0000000000ULL; // 64-bit code segment, ring 0, executable/readable
+    entries[2] = 0x0000920000000000ULL; // 64-bit data segment, ring 0, writable
+
+    Print(L"GDT built at: %p\n", gdt);
+    return entries;
+}
+
+uint64_t* init_IDT(EFI_SYSTEM_TABLE *SystemTable)
+{
+    void *idt = NULL;
+    EFI_STATUS status;
+
+    status = SystemTable->BootServices->AllocatePages(
+        AllocateAnyPages, EfiRuntimeServicesData, 1,
+        (EFI_PHYSICAL_ADDRESS *)&idt
+    );
+    if (status != EFI_SUCCESS)
+    {
+        Print(L"Failed to allocate IDT. Status: %d\n", status);
+        return NULL;
+    }
+
+    // 256 entries x 16 bytes = 4096 bytes = exactly 1 page
+    // all zeroed = all entries "not present", any exception without
+    // a real handler will cause a clean #VMEXIT instead of undefined behavior
+    uint8_t *raw = (uint8_t*)idt;
+    for (int i = 0; i < 4096; i++)
+    {
+        raw[i] = 0;
+    }
+
+    Print(L"IDT built at: %p\n", idt);
+    return (uint64_t*)idt;
+}
+
 int check_1gb_pages_support()
 {
     uint32_t eax, ebx, ecx, edx;
@@ -142,15 +251,23 @@ void* init_NPT(EFI_SYSTEM_TABLE *SystemTable)
         return NULL;
     }
 
+    uint64_t highest_addr = get_highest_physical_address(SystemTable);
+    if (highest_addr == 0)
+    {
+        Print(L"Failed to determine RAM size, aborting NPT build.\n");
+        return NULL;
+    }
+
+    // round up to the next full GB, then convert to a number of 1GB entries
+    uint64_t gb_to_map = (highest_addr + 0x40000000ULL - 1) / 0x40000000ULL;
+    Print(L"Mapping %d GB via NPT.\n", (int)gb_to_map);
+
     void *pml4 = NULL;
     void *pdpt = NULL;
     EFI_STATUS status;
 
-    // PML4: top level table, 1 page
     status = SystemTable->BootServices->AllocatePages(
-        AllocateAnyPages,
-        EfiRuntimeServicesData,
-        1,
+        AllocateAnyPages, EfiRuntimeServicesData, 1,
         (EFI_PHYSICAL_ADDRESS *)&pml4
     );
     if (status != EFI_SUCCESS)
@@ -159,11 +276,8 @@ void* init_NPT(EFI_SYSTEM_TABLE *SystemTable)
         return NULL;
     }
 
-    // PDPT: second level table, 1 page
     status = SystemTable->BootServices->AllocatePages(
-        AllocateAnyPages,
-        EfiRuntimeServicesData,
-        1,
+        AllocateAnyPages, EfiRuntimeServicesData, 1,
         (EFI_PHYSICAL_ADDRESS *)&pdpt
     );
     if (status != EFI_SUCCESS)
@@ -172,7 +286,6 @@ void* init_NPT(EFI_SYSTEM_TABLE *SystemTable)
         return NULL;
     }
 
-    // clear both tables
     uint64_t *pml4_entries = (uint64_t*)pml4;
     uint64_t *pdpt_entries = (uint64_t*)pdpt;
     for (int i = 0; i < 512; i++)
@@ -181,21 +294,19 @@ void* init_NPT(EFI_SYSTEM_TABLE *SystemTable)
         pdpt_entries[i] = 0;
     }
 
-    // PML4[0] points to our PDPT. Flags: Present(0) + Writable(1) + User(2)
     pml4_entries[0] = ((uint64_t)(uintptr_t)pdpt) | 0x7;
 
-    // PDPT[0..3]: four 1GB entries, identity-mapped, covering 0GB to 4GB
-    // Flags: Present(0) + Writable(1) + User(2) + PageSize/1GB(7)
-    for (int i = 0; i < 4; i++)
+    // map exactly as many 1GB entries as needed to cover all real RAM
+    for (uint64_t i = 0; i < gb_to_map && i < 512; i++)
     {
-        uint64_t phys_1gb_base = (uint64_t)i * 0x40000000ULL; // i * 1GB
+        uint64_t phys_1gb_base = i * 0x40000000ULL;
         pdpt_entries[i] = phys_1gb_base | 0x87;
     }
 
     Print(L"NPT built. PML4 at: %p, PDPT at: %p\n", pml4, pdpt);
 
     return pml4;
-}
+}   
 
 int check_svm_support() //SVM — Secure Virtual Machine
 {
@@ -478,17 +589,31 @@ void fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable)
     vmcb->StateSaveArea.Gs.Limit    = 0xFFFF;
     vmcb->StateSaveArea.Gs.Base     = 0x00000000;
 
-    // GDTR: no GDT set up yet for this minimal guest, left empty
-    vmcb->StateSaveArea.Gdtr.Selector = 0x0000;
+    // GDTR: real GDT built via init_GDT(), with code (0x08) and data (0x10) segments
+    uint64_t *gdt = init_GDT(SystemTable);
+    if (gdt == NULL)
+    {
+        Print(L"Failed to build GDT, aborting VMCB fill.\n");
+        return;
+    }
+    vmcb->StateSaveArea.Cs.Selector = 0x08; // index 1 in GDT (code segment)
+    vmcb->StateSaveArea.Ds.Selector = 0x10;
+    vmcb->StateSaveArea.Ss.Selector = 0x10; // index 2 in GDT (data segment)
     vmcb->StateSaveArea.Gdtr.Attrib   = 0x0000;
-    vmcb->StateSaveArea.Gdtr.Limit    = 0x0000;
-    vmcb->StateSaveArea.Gdtr.Base     = 0x00000000;
+    vmcb->StateSaveArea.Gdtr.Limit    = (3 * 8) - 1; // 3 entries of 8 bytes each, limit = size-1
+    vmcb->StateSaveArea.Gdtr.Base     = (uint64_t)(uintptr_t)gdt;
 
-    // IDTR: no IDT set up yet for this minimal guest, left empty
+    // IDTR: 256 entries of 16 bytes each (64-bit IDT gate size), all present=0 for now
+    uint64_t *idt = init_IDT(SystemTable);
+    if (idt == NULL)
+    {
+        Print(L"Failed to build IDT, aborting VMCB fill.\n");
+        return;
+    }
     vmcb->StateSaveArea.Idtr.Selector = 0x0000;
     vmcb->StateSaveArea.Idtr.Attrib   = 0x0000;
-    vmcb->StateSaveArea.Idtr.Limit    = 0x0000;
-    vmcb->StateSaveArea.Idtr.Base     = 0x00000000;
+    vmcb->StateSaveArea.Idtr.Limit    = (256 * 16) - 1;
+    vmcb->StateSaveArea.Idtr.Base     = (uint64_t)(uintptr_t)idt;
 
     // TR: task register, present + 32-bit TSS type, not really used by this guest
     vmcb->StateSaveArea.Tr.Selector = 0x0000;
