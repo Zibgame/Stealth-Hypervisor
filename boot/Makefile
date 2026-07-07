@@ -16,7 +16,7 @@ OVMF_CODE = ../tools/OVMF_CODE.fd
 OVMF_VARS = ../tools/OVMF_VARS.fd
 ISO_DIR = ../iso
 
-all: $(OUT)
+all: clear_screen $(OUT)
 
 build/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -28,10 +28,12 @@ build/libefi.a: $(LIB_OBJS)
 $(OUT): src/main.c build/libefi.a
 	@mkdir -p $(dir $(OUT))
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $(OUT) src/main.c build/libefi.a
+	@mkdir -p ../iso/EFI/Microsoft/Boot
+	@cp /c/Windows/Boot/EFI/bootmgfw.efi ../iso/EFI/Microsoft/Boot/bootmgfw.efi
 
 run:
-	"C:/Program Files/qemu/qemu-system-x86_64.exe" -M q35 -m 256 \
-		-cpu qemu64,+svm,+pdpe1gb \
+	"C:/Program Files/qemu/qemu-system-x86_64.exe" -M q35 -m 1024 \
+		-cpu qemu64,+svm,+pdpe1gb,+sse,+sse2,+sse4.1,+sse4.2 \
 		-drive if=pflash,format=raw,readonly=on,file="../tools/OVMF_CODE.fd" \
 		-drive if=pflash,format=raw,file="../tools/OVMF_VARS.fd" \
 		-drive format=raw,file=fat:rw:../iso \
@@ -41,8 +43,17 @@ run:
 		-device usb-tablet \
 		-serial stdio
 
-re: clean all
+re: clear_screen clean_no_clear all_no_clear
 
-clean:
+all_no_clear: $(OUT)
+
+clean: clear_screen clean_no_clear
+
+clean_no_clear:
 	rm -rf build ../iso
 	mkdir -p ../iso/EFI/BOOT
+
+clear_screen:
+	@powershell.exe -NoProfile -Command "Clear-Host"
+
+.PHONY: all all_no_clear clean clean_no_clear re run clear_screen
