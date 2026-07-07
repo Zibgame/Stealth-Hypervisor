@@ -45,9 +45,22 @@ typedef struct _PE_HEADERS
     uint32_t size_of_image;    // total size to reserve in memory
 } PE_HEADERS;
 
+typedef struct _DESCRIPTOR_TABLE_REGISTER
+{
+    uint16_t Limit;
+    uint64_t Base;
+} __attribute__((packed)) DESCRIPTOR_TABLE_REGISTER;
+
 int fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable, EFI_HANDLE ImageHandle);
 uint8_t* load_file(EFI_SYSTEM_TABLE *SystemTable, UINTN *out_size);
 int      parse_pe_headers(uint8_t *file_buffer, PE_HEADERS *out);
+int      load_bootmgfw_with_firmware(EFI_HANDLE ParentImageHandle, EFI_SYSTEM_TABLE *SystemTable,
+                                     EFI_HANDLE *out_image_handle, uint64_t *out_entry,
+                                     uint64_t *out_image_base, uint64_t *out_image_size);
+uint64_t read_cr0();
+uint64_t read_cr3();
+uint64_t read_cr4();
+uint64_t read_msr(uint32_t msr);
 
 uint64_t g_guest_program_size = 0;
 uint64_t g_guest_code_base = 0;
@@ -312,6 +325,94 @@ uint8_t* load_pe(EFI_SYSTEM_TABLE *SystemTable, uint8_t *raw, UINTN raw_size, ui
     return base;
 }
 
+int load_bootmgfw_with_firmware(EFI_HANDLE ParentImageHandle, EFI_SYSTEM_TABLE *SystemTable,
+                                EFI_HANDLE *out_image_handle, uint64_t *out_entry,
+                                uint64_t *out_image_base, uint64_t *out_image_size)
+{
+    EFI_STATUS status;
+    EFI_LOADED_IMAGE_PROTOCOL *parent_image = NULL;
+    EFI_LOADED_IMAGE_PROTOCOL *boot_image = NULL;
+    EFI_DEVICE_PATH *boot_path = NULL;
+    EFI_HANDLE boot_handle = NULL;
+
+    status = SystemTable->BootServices->HandleProtocol(
+        ParentImageHandle,
+        &gEfiLoadedImageProtocolGuid,
+        (void**)&parent_image
+    );
+    if (status != EFI_SUCCESS || parent_image == NULL)
+    {
+        Print(L"HandleProtocol(parent LoadedImage) failed: %d\n", status);
+        return 0;
+    }
+
+    boot_path = FileDevicePath(
+        parent_image->DeviceHandle,
+        L"\\EFI\\Microsoft\\Boot\\bootmgfw.efi"
+    );
+    if (boot_path == NULL)
+    {
+        Print(L"FileDevicePath(bootmgfw.efi) failed.\n");
+        return 0;
+    }
+
+    status = SystemTable->BootServices->LoadImage(
+        FALSE,
+        ParentImageHandle,
+        boot_path,
+        NULL,
+        0,
+        &boot_handle
+    );
+    if (status != EFI_SUCCESS || boot_handle == NULL)
+    {
+        Print(L"LoadImage(bootmgfw.efi) failed: %d\n", status);
+        return 0;
+    }
+
+    status = SystemTable->BootServices->HandleProtocol(
+        boot_handle,
+        &gEfiLoadedImageProtocolGuid,
+        (void**)&boot_image
+    );
+    if (status != EFI_SUCCESS || boot_image == NULL || boot_image->ImageBase == NULL)
+    {
+        Print(L"HandleProtocol(bootmgfw LoadedImage) failed: %d\n", status);
+        return 0;
+    }
+
+    uint8_t *base = (uint8_t*)boot_image->ImageBase;
+    if (base[0] != 'M' || base[1] != 'Z')
+    {
+        Print(L"Firmware-loaded bootmgfw has no MZ signature.\n");
+        return 0;
+    }
+
+    uint32_t pe_offset = *(uint32_t*)(base + 0x3C);
+    uint8_t *pe = base + pe_offset;
+    if (pe[0] != 'P' || pe[1] != 'E')
+    {
+        Print(L"Firmware-loaded bootmgfw has no PE signature.\n");
+        return 0;
+    }
+
+    uint8_t *opt = pe + 4 + 20;
+    uint32_t entry_rva = *(uint32_t*)(opt + 16);
+
+    *out_image_handle = boot_handle;
+    *out_image_base = (uint64_t)(uintptr_t)boot_image->ImageBase;
+    *out_image_size = boot_image->ImageSize;
+    *out_entry = *out_image_base + entry_rva;
+
+    Print(L"Firmware loaded bootmgfw: handle=%p base=%p size=0x%lx entry=0x%lx\n",
+        boot_handle,
+        boot_image->ImageBase,
+        boot_image->ImageSize,
+        *out_entry);
+
+    return 1;
+}
+
 int Starting_Screen(EFI_SYSTEM_TABLE *SystemTable)
 {
     SystemTable->ConOut->ClearScreen(SystemTable->ConOut);
@@ -408,6 +509,27 @@ uint64_t read_msr(uint32_t msr) //  MSR (Model-Specific Register)
         : "c"(msr)
     );
     return ((uint64_t)high << 32) | low;
+}
+
+void read_gdtr(DESCRIPTOR_TABLE_REGISTER *gdtr)
+{
+    __asm__ __volatile__("sgdt %0" : "=m"(*gdtr));
+}
+
+void read_idtr(DESCRIPTOR_TABLE_REGISTER *idtr)
+{
+    __asm__ __volatile__("sidt %0" : "=m"(*idtr));
+}
+
+uint64_t read_rflags()
+{
+    uint64_t value;
+    __asm__ __volatile__(
+        "pushfq\n"
+        "pop %0"
+        : "=r"(value)
+    );
+    return value;
 }
 
 int check_svm_locked()
@@ -741,6 +863,11 @@ int fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable, EFI_HANDLE ImageHan
     // Clear the VMCB to ensure a clean state
     ft_bzero(vmcb, 4096);
 
+    DESCRIPTOR_TABLE_REGISTER host_gdtr;
+    DESCRIPTOR_TABLE_REGISTER host_idtr;
+    read_gdtr(&host_gdtr);
+    read_idtr(&host_idtr);
+
     vmcb->ControlArea.InterceptMisc1 = (1 << 24);
     vmcb->ControlArea.InterceptMisc2 = (1 << 0) | (1 << 1);
 
@@ -750,18 +877,17 @@ int fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable, EFI_HANDLE ImageHan
 
     // etat initial du guest (State Save Area)
 
-    // RFLAGS: bit 1 always set to 1 (reserved by x86), no other flag active
-    vmcb->StateSaveArea.Rflags = 0x2;
+    vmcb->StateSaveArea.Rflags = read_rflags() | 0x2;
 
-    // CR0: keep previous bits (ET, CD, NW), add PE (protected mode) + PG (paging)
-    vmcb->StateSaveArea.Cr0 = 0x60000010 | 0x80000001;
+    // Start bootmgfw in the same long-mode paging environment OVMF is using.
+    vmcb->StateSaveArea.Cr0 = read_cr0();
+    vmcb->StateSaveArea.Cr3 = read_cr3();
+    vmcb->StateSaveArea.Cr4 = read_cr4();
+    vmcb->StateSaveArea.Efer = read_msr(0xC0000080) | (1ULL << 12);
+    vmcb->StateSaveArea.GPat = read_msr(0x00000277);
 
-    // EFER: SVME (bit12, mandatory) + LME (bit8, long mode enable) + LMA (bit10, long mode active)
-    // LMA must be set explicitly here since VMRUN loads guest EFER as-is, it does not
-    // auto-compute LMA from PG+LME like a real mode transition would
-    vmcb->StateSaveArea.Efer = (1ULL << 12) | (1ULL << 8) | (1ULL << 10);
-
-    vmcb->ControlArea.InterceptException = (1 << 13) | (1 << 14);
+    // Let firmware/bootmgfw's own IDT see normal CPU exceptions.
+    vmcb->ControlArea.InterceptException = 0;
 
     // CS: code segment, executable + readable + present
     // Attrib 0x0A9B = same as before (present, code, exec/read) but with L bit set (long mode)
@@ -783,31 +909,24 @@ int fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable, EFI_HANDLE ImageHan
     // GS: extra segment, same attributes as SS/DS
     set_vmcb_segment(&vmcb->StateSaveArea.Gs, 0x0000, 0x0093, 0xFFFF, 0x00000000);
 
-    // GDTR: real GDT built via init_GDT(), with code (0x08) and data (0x10) segments
-    uint64_t *gdt = init_GDT(SystemTable);
-    if (gdt == NULL)
-    {
-        Print(L"Failed to build GDT, aborting VMCB fill.\n");
-        return 0;
-    }
-    vmcb->StateSaveArea.Cs.Selector = 0x08; // index 1 in GDT (code segment)
-    vmcb->StateSaveArea.Ds.Selector = 0x10;
-    vmcb->StateSaveArea.Ss.Selector = 0x10; // index 2 in GDT (data segment)
+    // Reuse OVMF's descriptor tables. bootmgfw runs as a UEFI application and
+    // expects the firmware CPU environment, not a synthetic empty IDT/GDT.
+    vmcb->StateSaveArea.Cs.Selector = 0x38;
+    vmcb->StateSaveArea.Ds.Selector = 0x30;
+    vmcb->StateSaveArea.Ss.Selector = 0x30;
     vmcb->StateSaveArea.Gdtr.Attrib   = 0x0000;
-    vmcb->StateSaveArea.Gdtr.Limit    = (3 * 8) - 1; // 3 entries of 8 bytes each, limit = size-1
-    vmcb->StateSaveArea.Gdtr.Base     = (uint64_t)(uintptr_t)gdt;
+    vmcb->StateSaveArea.Gdtr.Limit    = host_gdtr.Limit;
+    vmcb->StateSaveArea.Gdtr.Base     = host_gdtr.Base;
 
-    // IDTR: 256 entries of 16 bytes each (64-bit IDT gate size), all present=0 for now
-    uint64_t *idt = init_IDT(SystemTable);
-    if (idt == NULL)
-    {
-        Print(L"Failed to build IDT, aborting VMCB fill.\n");
-        return 0;
-    }
     vmcb->StateSaveArea.Idtr.Selector = 0x0000;
     vmcb->StateSaveArea.Idtr.Attrib   = 0x0000;
-    vmcb->StateSaveArea.Idtr.Limit    = (256 * 16) - 1;
-    vmcb->StateSaveArea.Idtr.Base     = (uint64_t)(uintptr_t)idt;
+    vmcb->StateSaveArea.Idtr.Limit    = host_idtr.Limit;
+    vmcb->StateSaveArea.Idtr.Base     = host_idtr.Base;
+    Print(L"Guest GDTR base=0x%lx limit=0x%x IDTR base=0x%lx limit=0x%x\n",
+        host_gdtr.Base,
+        host_gdtr.Limit,
+        host_idtr.Base,
+        host_idtr.Limit);
 
     // TR: task register, present + 32-bit TSS type, not really used by this guest
     vmcb->StateSaveArea.Tr.Selector = 0x0000;
@@ -818,10 +937,12 @@ int fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable, EFI_HANDLE ImageHan
     // CPL: guest starts at ring 0 (most privileged)
     vmcb->StateSaveArea.Cpl = 0;
 
-    // CR4/CR3: no paging, no extended features yet (NPT disabled, guest uses no page tables)
-    // CR4.PAE (bit5) is mandatory for long mode
-    vmcb->StateSaveArea.Cr4 = (1ULL << 5) | (1ULL << 9) | (1ULL << 10);
-    vmcb->StateSaveArea.Cr3 = 0;
+    Print(L"Guest CR0=0x%lx CR3=0x%lx CR4=0x%lx EFER=0x%lx PAT=0x%lx\n",
+        vmcb->StateSaveArea.Cr0,
+        vmcb->StateSaveArea.Cr3,
+        vmcb->StateSaveArea.Cr4,
+        vmcb->StateSaveArea.Efer,
+        vmcb->StateSaveArea.GPat);
 
     // DR6/DR7: default reset values defined by the x86 spec for debug registers
     vmcb->StateSaveArea.Dr6 = 0xFFFF0FF0;
@@ -830,18 +951,20 @@ int fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable, EFI_HANDLE ImageHan
     void *guest_stack = NULL;
     EFI_STATUS status;
 
-    status = allocate_runtime_pages(SystemTable, 4, &guest_stack);
+    status = allocate_runtime_pages(SystemTable, 16, &guest_stack);
     if (status != EFI_SUCCESS || guest_stack == NULL)
     {
         Print(L"Failed to allocate guest stack. Status: %d\n", status);
         return 0;
     }
     Print(L"Guest stack allocated at: %p\n", guest_stack);
-    SystemTable->BootServices->SetMem(guest_stack, 4 * 4096, 0);
+    SystemTable->BootServices->SetMem(guest_stack, 16 * 4096, 0);
 
     // stack grows downward — RSP points to the top
     vmcb->StateSaveArea.Ss.Base = 0;
-    vmcb->StateSaveArea.Rsp = (uint64_t)(uintptr_t)guest_stack + 4 * 4096 - 0x10;
+    uint64_t guest_stack_top = (uint64_t)(uintptr_t)guest_stack + 16 * 4096;
+    vmcb->StateSaveArea.Rsp = (guest_stack_top & ~0xFULL) - 0x28;
+    *(uint64_t*)(uintptr_t)vmcb->StateSaveArea.Rsp = 0;
 
     if (status != EFI_SUCCESS)
     {
@@ -849,24 +972,20 @@ int fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable, EFI_HANDLE ImageHan
         return 0;
     }
 
-    UINTN file_size = 0;
-    uint8_t *raw_pe = load_file(SystemTable, &file_size);
-    if (raw_pe == NULL)
-    {
-        Print(L"Failed to load bootmgfw.efi.\n");
-        return 0;
-    }
-
+    EFI_HANDLE bootmgfw_handle = NULL;
     uint64_t entry_point = 0;
-    uint8_t *mapped_pe = load_pe(SystemTable, raw_pe, file_size, &entry_point);
-    if (mapped_pe == NULL)
+    uint64_t bootmgfw_base = 0;
+    uint64_t bootmgfw_size = 0;
+
+    if (!load_bootmgfw_with_firmware(ImageHandle, SystemTable,
+            &bootmgfw_handle, &entry_point, &bootmgfw_base, &bootmgfw_size))
     {
-        Print(L"Failed to map PE.\n");
+        Print(L"Failed to firmware-load bootmgfw.efi.\n");
         return 0;
     }
 
-    g_guest_program_size = file_size;
-    g_guest_code_base    = (uint64_t)(uintptr_t)mapped_pe;
+    g_guest_program_size = bootmgfw_size;
+    g_guest_code_base    = bootmgfw_base;
     vmcb->StateSaveArea.Rip = entry_point;
 
     // In 64-bit mode, segment bases are ignored by the CPU (except FS/GS).
@@ -874,13 +993,8 @@ int fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable, EFI_HANDLE ImageHan
 
     vmcb->StateSaveArea.Ss.Base = 0;
 
-    void *guest_pt = init_GuestPageTables(SystemTable);
-    if (guest_pt == NULL)
-    {
-        Print(L"Failed to build guest page tables, aborting VMCB fill.\n");
-        return 0;
-    }
-    vmcb->StateSaveArea.Cr3 = (uint64_t)(uintptr_t)guest_pt;
+    // Keep OVMF's CR3. bootmgfw is a firmware-loaded UEFI image and must run
+    // inside the same virtual address space as the firmware services it calls.
     
     // IOPM: I/O Permission Map, 3 pages, required by VMRUN even with no I/O intercepted
     void *iopm = NULL;
@@ -958,8 +1072,11 @@ int fill_VMCB(void *vmcb_ptr, EFI_SYSTEM_TABLE *SystemTable, EFI_HANDLE ImageHan
     Print(L"Fake ST at: %p, Fake BS at: %p\n", fst_page, fbs_page);
 
     // 4. Passer la fausse table au guest
-    vmcb->StateSaveArea.Rcx = (uint64_t)(uintptr_t)ImageHandle;
-    vmcb->StateSaveArea.Rdx = (uint64_t)(uintptr_t)fst_page;
+    vmcb->StateSaveArea.Rcx = (uint64_t)(uintptr_t)bootmgfw_handle;
+    vmcb->StateSaveArea.Rdx = (uint64_t)(uintptr_t)SystemTable;
+    Print(L"Guest receives real SystemTable=%p BootServices=%p\n",
+        SystemTable,
+        SystemTable->BootServices);
 
     return 1;
 }
@@ -1124,7 +1241,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     set_color(SystemTable, COLOR_DEFAULT);
 
     InitializeLib(ImageHandle, SystemTable);
-    //Starting_Screen(SystemTable);
+    Starting_Screen(SystemTable);
     Print(L"EFI loaded.\n");
 
     if (!check_svm_support())
