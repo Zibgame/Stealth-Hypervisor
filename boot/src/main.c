@@ -6,8 +6,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define HV_BUILD_TAG "transparent-svm-v57-shadow-svme"
-#define HV_BOOT_NATIVE_APS 1
+#define HV_BUILD_TAG "transparent-svm-v58-multicore-clean"
+#define HV_VIRTUALIZE_ALL_CPUS 1
 #define HV_MAX_CPUS 256
 #define HV_HOST_STACK_PAGES 16
 #define HV_LOG_ENTRIES 1024
@@ -607,32 +607,78 @@ static uint32_t current_apic_id(void)
 #define XAPIC_ICR_LOW    0x300U
 #define XAPIC_ICR_HIGH   0x310U
 
-static void xapic_set_mapping(uint64_t page,int writable)
+
+static void xapic_set_mapping(uint64_t page, int writable)
 {
     HV_CPU *bsp;
-    if(!g_apic_npt_pte)return;
-    *g_apic_npt_pte=(page&~0xfffULL)|(writable?7ULL:5ULL);
-    __atomic_store_n(&g_root.xapic_flush_pending,1,__ATOMIC_SEQ_CST);
-    bsp=&g_root.cpus[g_root.bsp_number];
-    bsp->vmcb->control.tlb_control=1;
-    bsp->vmcb->control.vmcb_clean=0;
+
+    if (g_apic_npt_pte == NULL)
+    {
+        return;
+    }
+
+    *g_apic_npt_pte = (page & ~0xfffULL) | (writable ? 7ULL : 5ULL);
+
+    __atomic_store_n(
+        &g_root.xapic_flush_pending,
+        1,
+        __ATOMIC_SEQ_CST
+    );
+
+    bsp = &g_root.cpus[g_root.bsp_number];
+    bsp->vmcb->control.tlb_control = 1;
+    bsp->vmcb->control.vmcb_clean = 0;
 }
+
 
 static void xapic_set_intercept(int enable)
 {
-    if(!g_apic_npt_pte||g_root.x2apic)return;
-    g_root.xapic_intercept_active=enable?1U:0U;
-    xapic_set_mapping(XAPIC_BASE,enable?0:1);
-    ring_log(&g_root.cpus[g_root.bsp_number],enable?HV_EVT_APIC_ON:HV_EVT_APIC_OFF,
-             g_root.sipi_remaining,0,0,0);
+    if (g_apic_npt_pte == NULL || g_root.x2apic)
+    {
+        return;
+    }
+
+    g_root.xapic_intercept_active = enable ? 1U : 0U;
+
+    xapic_set_mapping(
+        XAPIC_BASE,
+        enable ? 0 : 1
+    );
+
+    ring_log(
+        &g_root.cpus[g_root.bsp_number],
+        enable ? HV_EVT_APIC_ON : HV_EVT_APIC_OFF,
+        g_root.sipi_remaining,
+        0,
+        0,
+        0
+    );
 }
 
-static int icr_targets_cpu(HV_CPU *source,HV_CPU *target,uint32_t dest,uint32_t shorthand)
+
+static int icr_targets_cpu(
+    HV_CPU *source,
+    HV_CPU *target,
+    uint32_t destination,
+    uint32_t shorthand
+)
 {
-    if(shorthand==1)return target==source;
-    if(shorthand==2)return 1;
-    if(shorthand==3)return target!=source;
-    return target->apic_id==dest;
+    if (shorthand == 1)
+    {
+        return target == source;
+    }
+
+    if (shorthand == 2)
+    {
+        return 1;
+    }
+
+    if (shorthand == 3)
+    {
+        return target != source;
+    }
+
+    return target->apic_id == destination;
 }
 
 static void handle_icr(HV_CPU *cpu,uint64_t icr)
@@ -877,16 +923,36 @@ void svm_handle_guest_exit(HV_CPU *cpu,HV_EXIT_FRAME *f)
         }
         cpuid(leaf,sub,&a,&b,&c,&d);
 
-        /* Never expose nested hardware virtualization to this guest. */
-        if(leaf==1){
-            c&=~(1U<<5);              /* VMX */
-            if(!HV_BOOT_NATIVE_APS)c|=(1U<<31);
-        }
-        if(leaf==0x80000001)c&=~(1U<<2); /* SVM */
-        if(leaf==0x8000000A){a=0;b=0;c=0;d=0;}
+        /* Keep nested virtualization hidden from Windows. */
+        if (leaf == 1)
+        {
+            c &= ~(1U << 5);
 
-        if(!HV_BOOT_NATIVE_APS&&leaf==0x40000000){
-            a=0x40000000;b=0x48564300;c=0;d=0;
+            if (HV_VIRTUALIZE_ALL_CPUS)
+            {
+                c |= 1U << 31;
+            }
+        }
+
+        if (leaf == 0x80000001)
+        {
+            c &= ~(1U << 2);
+        }
+
+        if (leaf == 0x8000000A)
+        {
+            a = 0;
+            b = 0;
+            c = 0;
+            d = 0;
+        }
+
+        if (HV_VIRTUALIZE_ALL_CPUS && leaf == 0x40000000)
+        {
+            a = 0x40000000;
+            b = 0x48564300;
+            c = 0;
+            d = 0;
         }
 
         v->state.rax=a;f->rbx=b;f->rcx=c;f->rdx=d;
@@ -1064,15 +1130,44 @@ HV_CPU *svm_prepare_cpu_context(HV_CPU *cpu,uint64_t guest_rsp,uint64_t guest_ri
     return cpu;
 }
 
+
 static void EFIAPI virtualize_ap(void *context)
 {
-    HV_ROOT *r=context; UINTN n=0; EFI_MP_SERVICES_PROTOCOL *mp=r->mp;
-    if(EFI_ERROR(mp->WhoAmI(mp,&n))||n>=r->cpu_count)return;
-    if(svm_enter_context_resume(&r->cpus[n])){
-        enable_runtime_intercepts(&r->cpus[n]);
-        __atomic_fetch_add(&r->virtualized_count,1,__ATOMIC_SEQ_CST);
-        ring_log(&r->cpus[n],HV_EVT_CPU_GUEST,0,0,0,0);
+    HV_ROOT *root = context;
+    EFI_MP_SERVICES_PROTOCOL *mp = root->mp;
+    UINTN processor_number = 0;
+
+    if (EFI_ERROR(mp->WhoAmI(mp, &processor_number)))
+    {
+        return;
     }
+
+    if (processor_number >= root->cpu_count)
+    {
+        return;
+    }
+
+    if (!svm_enter_context_resume(&root->cpus[processor_number]))
+    {
+        return;
+    }
+
+    enable_runtime_intercepts(&root->cpus[processor_number]);
+
+    __atomic_fetch_add(
+        &root->virtualized_count,
+        1,
+        __ATOMIC_SEQ_CST
+    );
+
+    ring_log(
+        &root->cpus[processor_number],
+        HV_EVT_CPU_GUEST,
+        root->virtualized_count,
+        root->enabled_cpu_count,
+        0,
+        0
+    );
 }
 
 static int setup_cpus(void)
@@ -1098,19 +1193,70 @@ static int setup_cpus(void)
     return 1;
 }
 
+
 static int virtualize_aps(void)
 {
-    EFI_STATUS s;UINTN *failed=NULL,i;
-    if(g_root.enabled_cpu_count<=1)return 1;
-    /* Ten seconds is ample for firmware AP dispatch and prevents silent hangs. */
-    s=((EFI_MP_SERVICES_PROTOCOL*)g_root.mp)->StartupAllAPs(
-        g_root.mp,virtualize_ap,TRUE,NULL,10000000,&g_root,&failed);
-    if(EFI_ERROR(s)){
-        file_log_value("StartupAllAPs status=",s);
-        if(failed){for(i=0;failed[i]!=HV_END_OF_CPU_LIST;i++)file_log_value("AP failed processor=",failed[i]);
-            g_root.st->BootServices->FreePool(failed);}
+    EFI_MP_SERVICES_PROTOCOL *mp;
+    EFI_STATUS status;
+    UINTN *failed = NULL;
+    UINTN index;
+
+    if (g_root.enabled_cpu_count <= 1)
+    {
+        return 1;
+    }
+
+    mp = g_root.mp;
+
+    status = mp->StartupAllAPs(
+        mp,
+        virtualize_ap,
+        TRUE,
+        NULL,
+        10000000,
+        &g_root,
+        &failed
+    );
+
+    if (EFI_ERROR(status))
+    {
+        file_log_value("StartupAllAPs status=", status);
+
+        if (failed != NULL)
+        {
+            for (
+                index = 0;
+                failed[index] != HV_END_OF_CPU_LIST;
+                index++
+            )
+            {
+                file_log_value(
+                    "AP failed processor=",
+                    failed[index]
+                );
+            }
+
+            g_root.st->BootServices->FreePool(failed);
+        }
+
         return 0;
     }
+
+    if (g_root.virtualized_count != g_root.enabled_cpu_count)
+    {
+        file_log_value(
+            "VIRTUALIZED CPU COUNT=",
+            g_root.virtualized_count
+        );
+
+        file_log_value(
+            "EXPECTED CPU COUNT=",
+            g_root.enabled_cpu_count
+        );
+
+        return 0;
+    }
+
     return 1;
 }
 
@@ -1176,65 +1322,127 @@ static int suppress_image_relocation(void)
     *signature=0;return 1;
 }
 
-static VOID EFIAPI on_exit_boot_services(EFI_EVENT event,VOID *context)
+
+static void force_host_rendezvous(void)
 {
-    HV_ROOT *r=(HV_ROOT*)context;
-    (void)event;r->exit_boot_seen=1;
+    uint64_t value;
 
-    /*
-     * Safe-boot mode: only the BSP remains virtualized. The APs are left in
-     * their normal firmware state so Windows can start them with the physical
-     * INIT/SIPI sequence. This deliberately avoids the experimental xAPIC
-     * NPT + TF/#DB single-step path that produced SVM_EXIT_SHUTDOWN (0x7F).
-     */
-    if(HV_BOOT_NATIVE_APS){
-        HV_CPU *bsp=&r->cpus[r->bsp_number];
-        uint64_t ignored;
+    value = rdmsr(SVM_MSR_VM_CR);
+    (void)value;
+}
 
-        r->sipi_remaining=0;
-        r->apic_started_count=0;
-        ring_log(bsp,HV_EVT_EXIT_BOOT,0,r->cpu_count,1,0);
-        framebuffer_stage(HV_STAGE_NATIVE_APS,0x00008844U);
 
-        /*
-         * The firmware CPUID polling workaround may have disabled the CPUID
-         * intercept. Re-arm it for Windows, then force a VMEXIT through the
-         * already-trapped VM_CR read. Unlike VMMCALL, RDMSR does not require
-         * guest EFER.SVME.
-         */
-        bsp->vmcb->control.intercept_misc1|=SVM_INTERCEPT_CPUID;
-        bsp->vmcb->control.vmcb_clean=0;
-        ignored=rdmsr(SVM_MSR_VM_CR);
-        (void)ignored;
+static VOID EFIAPI on_exit_boot_services(
+    EFI_EVENT event,
+    VOID *context
+)
+{
+    HV_ROOT *root = context;
+    HV_CPU *bsp;
+
+    (void)event;
+
+    root->exit_boot_seen = 1;
+    bsp = &root->cpus[root->bsp_number];
+
+    if (!HV_VIRTUALIZE_ALL_CPUS)
+    {
+        root->sipi_remaining = 0;
+        root->apic_started_count = 0;
+
+        ring_log(
+            bsp,
+            HV_EVT_EXIT_BOOT,
+            0,
+            root->cpu_count,
+            1,
+            0
+        );
+
+        framebuffer_stage(
+            HV_STAGE_NATIVE_APS,
+            0x00008844U
+        );
+
+        bsp->vmcb->control.intercept_misc1 |= SVM_INTERCEPT_CPUID;
+        bsp->vmcb->control.vmcb_clean = 0;
+
+        force_host_rendezvous();
         return;
     }
 
-    r->sipi_remaining=(uint32_t)((r->enabled_cpu_count>1)?(r->enabled_cpu_count-1)*2:0);
-    r->apic_started_count=0;
-    /* APs may already be in #SX. Never overwrite their live INIT/SIPI state here. */
-    ring_log(&r->cpus[r->bsp_number],HV_EVT_EXIT_BOOT,r->sipi_remaining,r->cpu_count,0,0);
-    framebuffer_stage(HV_STAGE_EBS,0x00555500U);
+    root->sipi_remaining = (uint32_t)(
+        (root->enabled_cpu_count > 1)
+            ? (root->enabled_cpu_count - 1) * 2
+            : 0
+    );
+
+    root->apic_started_count = 0;
+
+    ring_log(
+        bsp,
+        HV_EVT_EXIT_BOOT,
+        root->sipi_remaining,
+        root->cpu_count,
+        0,
+        0
+    );
+
+    framebuffer_stage(
+        HV_STAGE_EBS,
+        0x00555500U
+    );
+
+    if (
+        !root->x2apic &&
+        root->sipi_remaining != 0 &&
+        !root->xapic_intercept_active
+    )
+    {
+        xapic_set_intercept(1);
+
+        framebuffer_stage(
+            HV_STAGE_APIC_ON,
+            0x000000ccU
+        );
+    }
 
     /*
-     * Windows can start sending INIT/SIPI immediately after ExitBootServices.
-     * Arm the xAPIC ICR trap now, before waiting for SetVirtualAddressMap.
-     * The VMMCALL forces a round trip through the host so tlb_control=1 is
-     * consumed by the next VMRUN and the new NPT permission is active before
-     * the first ICR write.
+     * Apply the NPT permission change before Windows sends INIT/SIPI.
      */
-    if(!r->x2apic&&r->sipi_remaining&&!r->xapic_intercept_active){
-        xapic_set_intercept(1);
-        framebuffer_stage(HV_STAGE_APIC_ON,0x000000ccU);
-        __asm__ __volatile__(".byte 0x0f,0x01,0xd9":::"memory");
-    }
+    force_host_rendezvous();
 }
 
-static VOID EFIAPI on_virtual_address_change(EFI_EVENT event,VOID *context)
+
+static VOID EFIAPI on_virtual_address_change(
+    EFI_EVENT event,
+    VOID *context
+)
 {
-    HV_ROOT *r=(HV_ROOT*)context;
-    (void)event;r->virtual_mode_seen=1;
-    ring_log(&r->cpus[r->bsp_number],HV_EVT_VIRTUAL_MODE,r->sipi_remaining,r->cpu_count,0,0);
-    if(!HV_BOOT_NATIVE_APS&&!r->x2apic&&r->sipi_remaining&&!r->xapic_intercept_active)r->apic_activation_pending=1;
+    HV_ROOT *root = context;
+
+    (void)event;
+
+    root->virtual_mode_seen = 1;
+
+    ring_log(
+        &root->cpus[root->bsp_number],
+        HV_EVT_VIRTUAL_MODE,
+        root->sipi_remaining,
+        root->cpu_count,
+        0,
+        0
+    );
+
+    if (
+        HV_VIRTUALIZE_ALL_CPUS &&
+        !root->x2apic &&
+        root->sipi_remaining != 0 &&
+        !root->xapic_intercept_active
+    )
+    {
+        root->apic_activation_pending = 1;
+    }
 }
 
 EFI_STATUS hv_runtime_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st)
@@ -1297,15 +1505,35 @@ EFI_STATUS hv_runtime_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *st)
     __atomic_fetch_add(&g_root.virtualized_count,1,__ATOMIC_SEQ_CST);g_root.log->cpu_count=(uint32_t)g_root.cpu_count;
     ring_log(&g_root.cpus[g_root.bsp_number],HV_EVT_CPU_GUEST,g_root.virtualized_count,g_root.cpu_count,0,0);
     file_log("BSP RESUMED IN GUEST");
-    if(HV_BOOT_NATIVE_APS){
+    if (!HV_VIRTUALIZE_ALL_CPUS)
+    {
         file_log("SAFE BOOT: AP VIRTUALIZATION SKIPPED");
-        Print(L"SAFE BOOT: BSP virtualized, APs left native: %u/%u\n",
-              g_root.virtualized_count,g_root.cpu_count);
-    }else{
+
+        Print(
+            L"SAFE BOOT: BSP virtualized, APs left native: %u/%u\n",
+            g_root.virtualized_count,
+            g_root.cpu_count
+        );
+    }
+    else
+    {
         file_log("AP VIRTUALIZATION BEGIN");
-        if(!virtualize_aps()){Print(L"AP virtualization failed.\n");file_log("AP VIRTUALIZATION FAILED");return EFI_TIMEOUT;}
+
+        if (!virtualize_aps())
+        {
+            Print(L"AP virtualization failed.\n");
+            file_log("AP VIRTUALIZATION FAILED");
+            return EFI_TIMEOUT;
+        }
+
         file_log("AP PROCESSORS VIRTUALIZED");
-        Print(L"ALL PROCESSORS VIRTUALIZED: %u/%u\n",g_root.virtualized_count,g_root.cpu_count);
+
+        Print(
+            L"ALL PROCESSORS VIRTUALIZED: %u/%u\n",
+            g_root.virtualized_count,
+            g_root.enabled_cpu_count
+        );
+
         file_log("ALL PROCESSORS VIRTUALIZED");
     }
     s=st->BootServices->CreateEvent(EVT_SIGNAL_EXIT_BOOT_SERVICES,TPL_NOTIFY,
