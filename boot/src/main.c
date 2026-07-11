@@ -251,12 +251,6 @@ void svm_handle_guest_exit(HV_CPU *cpu, HV_EXIT_FRAME *frame);
 
 #endif
 
-/*
- * Transparent UEFI AMD-SVM context-resume loader.
- *
- * The context-resume and INIT/SIPI design follows HelloAmdHvPkg by Satoshi
- * Tanda (MIT). This is a clean GNU-EFI implementation adapted to this loader.
- */
 #include <efiprot.h>
 
 #define HV_LOG_MAGIC 0x3430474f4c564848ULL /* HHVLOG04 */
@@ -707,7 +701,7 @@ static void handle_icr(HV_CPU *cpu,uint64_t icr)
                 ring_log(cpu,HV_EVT_SIPI,target->apic_id,vector,shorthand,g_root.sipi_remaining);
                 framebuffer_stage(HV_STAGE_SIPI,0x000088ccU);
                 if(target->sipi_count<2)target->sipi_count++;
-                /* SIPI can race ahead of the target's #SX VMEXIT. Preserve it. */
+                /* SIPI can race ahead of the target #SX VMEXIT. Preserve it. */
                 if(target->state!=HV_CPU_STARTED){
                     target->sipi_vector=vector;target->state=HV_CPU_SIPI_ISSUED;
                 }
